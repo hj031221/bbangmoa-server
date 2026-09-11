@@ -18,11 +18,22 @@ on:
     paths-ignore:
       - '**.md'
       - 'docs/**'
+  # PR 에서도 test 잡만 돈다(build·deploy 는 아래 if 로 막는다).
+  #   이게 없으면 테스트가 main 에 머지된 뒤에야 처음 돌아간다. 그러면
+  #   "테스트하고 머지한다"가 불가능해지고, 깨진 걸 알았을 땐 이미 main 이 깨져 있다.
+  #   로컬에 JDK 21 이 없는 사람도 PR 만 열면 검증이 되는 효과도 있다.
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch: {}      # 액션 탭에서 손으로도 돌릴 수 있게
 
 concurrency:
   # 배포가 겹치면 서버 상태가 꼬인다. 새 배포가 뜨면 진행 중인 건 취소.
-  group: deploy-main
+  # ref 를 키에 넣는 이유: 안 넣으면 PR 검증 실행끼리, 또 PR 과 main 배포가
+  # 서로를 취소한다(그룹이 하나뿐이라서).
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -84,6 +95,8 @@ jobs:
 
   build:
     needs: test
+    # PR 에서는 굽지도 배포하지도 않는다. 검증만 한다.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -127,6 +140,7 @@ jobs:
 
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
