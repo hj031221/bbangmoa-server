@@ -18,17 +18,14 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 
 /**
- * 외부 API 통과형 프록시. 상류 넷이 이 클래스 하나를 공유한다.
+ * 외부 API 통과형 프록시. 상류 다섯이 이 클래스 하나를 공유한다.
  *
- *   GET  /api/tour/areaBasedList2?...            → apis.data.go.kr (키: 쿼리)
- *   GET  /api/kakao/v2/local/search/keyword.json → dapi.kakao.com  (키: 헤더)
- *   GET  /api/kakaonavi/v1/directions?...        → apis-navi.kakaomobility.com
- *   POST /api/kakaonavi/v1/waypoints/directions  → apis-navi.kakaomobility.com
- *   POST /api/kakaonavi/v1/destinations/directions → apis-navi.kakaomobility.com
- *   GET  /api/odsay/v1/api/searchPubTransPathT   → api.odsay.com   (키: 쿼리)
- *   POST /api/tmap/tmap/routes/pedestrian        → apis.openapi.sk.com (키: 헤더, 바디 JSON)
+ * 어떤 경로가 어떤 메서드로 열려 있는지는 여기 적지 않는다 —
+ * application.yaml 의 app.upstreams.{이름}.routes 가 유일한 목록이다.
+ * 주석으로 한 벌 더 적어두면 설정만 고치고 주석을 안 고치는 날이 반드시 오고,
+ * 그때부터 이 주석은 사실이 아니라 거짓말이 된다.
  *
- * 이 클래스가 하는 일은 넷뿐이다 — 상류 식별, 메서드 확인, 화이트리스트 판정, 위임.
+ * 이 클래스가 하는 일은 넷뿐이다 — 상류 식별, 경로 판정, 메서드 확인, 위임.
  * 상류 주소도 모르고, 캐시가 있는지도 모르고, 응답 내용도 안 본다.
  */
 @RestController
@@ -56,22 +53,25 @@ public class UpstreamProxyController {
             throw new ProxyException(404, "알 수 없는 상류다: " + name);
         }
 
-        String method = request.getMethod();
-        if (!up.allowsMethod(method)) {
-            // 405 는 "이 경로는 있는데 그 메서드는 안 된다"는 뜻이라 정확하다.
-            throw new ProxyException(405, method + " 은(는) 허용되지 않는다");
-        }
-
         String path = remainingPath(request, name);
 
         // 2) 화이트리스트. 여기 없으면 상류를 부르지도, 캐시를 보지도 않는다.
         //    404 를 주는 이유: 403("있는데 막혔다")은 어떤 경로가 존재하는지를
         //    알려주는 셈이라 탐색에 도움을 준다. 없는 것처럼 보이는 편이 낫다.
-        if (!up.allows(path)) {
+        Upstream.Route route = up.route(path);
+        if (route == null) {
             throw new ProxyException(404, "지원하지 않는 경로다: " + path);
         }
 
-        // 3) 키가 없으면 상류를 부를 수 없다.
+        // 3) 메서드는 경로마다 따로 본다. 경로 판정보다 뒤에 오는 게 중요하다 —
+        //    앞에 두면 없는 경로에까지 405 를 주게 되어 "그 경로는 존재한다"를 알려주는 꼴이다.
+        String method = request.getMethod();
+        if (!route.allowsMethod(method)) {
+            // 405 는 "이 경로는 있는데 그 메서드는 안 된다"는 뜻이라 정확하다.
+            throw new ProxyException(405, method + " 은(는) 이 경로에 허용되지 않는다");
+        }
+
+        // 4) 키가 없으면 상류를 부를 수 없다.
         //    500(서버 버그)이 아니라 503(지금은 서비스 불가)이 맞다 —
         //    코드가 틀린 게 아니라 설정이 안 들어온 상태이기 때문이다.
         if (!up.hasKey()) {
@@ -84,6 +84,7 @@ public class UpstreamProxyController {
                 .contentType(r.contentType())
                 // 캐시가 실제로 도는지 브라우저 Network 탭에서 바로 보이게 한다.
                 // STALE 이 보이면 상류가 죽어 있다는 뜻이다 — 장애 감지 수단.
+                // OFF 는 이 경로가 캐시를 안 쓰도록 설정돼 있다는 뜻이다(TMAP).
                 .header("X-Cache", r.cacheStatus())
                 .body(r.body());
     }

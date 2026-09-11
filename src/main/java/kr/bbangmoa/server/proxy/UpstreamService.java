@@ -40,10 +40,12 @@ public class UpstreamService {
 
     private final UpstreamClient client;
     private final StringRedisTemplate redis;
+    private final UpstreamQuota quota;
 
-    public UpstreamService(UpstreamClient client, StringRedisTemplate redis) {
+    public UpstreamService(UpstreamClient client, StringRedisTemplate redis, UpstreamQuota quota) {
         this.client = client;
         this.redis = redis;
+        this.quota = quota;
     }
 
     /**
@@ -51,30 +53,52 @@ public class UpstreamService {
      *   HIT   신선한 캐시
      *   MISS  상류를 실제로 불러서 받아옴
      *   STALE 상류가 죽어서 예비 사본을 대신 내줌  ← 이게 있는지로 장애를 감지한다
+     *   OFF   이 경로는 캐시를 안 쓰도록 설정돼 있어 매번 상류로 갔다
      */
     public record Result(int status, MediaType contentType, byte[] body, String cacheStatus) {}
 
     public Result fetch(String name, Upstream up, String method, String path,
                         MultiValueMap<String, String> params, byte[] body) {
 
-        String key = cacheKey(name, method, path, params, body);
-        String staleKey = STALE_PREFIX + key;
+        // 수명이 0 이면 그 경로는 캐시를 안 쓴다 — 읽지도 쓰지도 않는다.
+        // TMAP 이 그렇다: 응답 하나가 50~160KB 인데 요청마다 좌표가 달라 적중률이 낮고,
+        // 레디스는 128MB 라 이것만으로 관광공사·카카오 캐시가 통째로 밀려난다.
+        Duration ttl = up.ttlFor(path);
+        Duration staleTtl = up.effectiveStaleTtl();
+        boolean useCache = isPositive(ttl);
+        boolean useStale = isPositive(staleTtl);
+
+        String key = (useCache || useStale) ? cacheKey(name, method, path, params, body) : null;
+        String staleKey = useStale ? STALE_PREFIX + key : null;
 
         // 1) 신선한 캐시가 있으면 끝.
-        Result hit = readCache(key, "HIT");
-        if (hit != null) return hit;
+        if (useCache) {
+            Result hit = readCache(key, "HIT");
+            if (hit != null) return hit;
+        }
 
-        // 2) 상류 호출. 실패하면 여기서 예외가 난다.
+        // 2) 오늘 이 상류를 부를 몫이 남았나. 캐시에 맞은 요청은 여기까지 안 오므로
+        //    실제로 나가는 호출만 세어진다.
+        if (!quota.tryConsume(name, up)) {
+            Result stale = useStale ? readCache(staleKey, "STALE") : null;
+            if (stale != null) {
+                log.warn("하루 한도 초과 — 예비 사본으로 응답한다: {} {}", name, path);
+                return stale;
+            }
+            throw new ProxyException(429, name + " 의 오늘 호출 한도를 모두 썼다");
+        }
+
+        // 3) 상류 호출. 실패하면 여기서 예외가 난다.
         UpstreamClient.Response up2;
         try {
             up2 = client.call(name, up, method, path, params, body);
         } catch (ProxyException e) {
-            // 3) 상류가 죽었다. 예비 사본이 있으면 그걸 준다.
+            // 4) 상류가 죽었다. 예비 사본이 있으면 그걸 준다.
             //
             //    실측상 관광공사 연결 성공률이 40% 수준이다. 이 폴백이 없으면
             //    캐시가 만료되는 순간마다 사용자 6할이 빈 화면을 본다.
             //    "정확하지만 없는 화면"보다 "조금 낡았지만 있는 화면"이 낫다.
-            Result stale = readCache(staleKey, "STALE");
+            Result stale = useStale ? readCache(staleKey, "STALE") : null;
             if (stale != null) {
                 log.warn("상류 실패 — 예비 사본으로 응답한다: {} {}", name, path);
                 return stale;
@@ -90,9 +114,14 @@ public class UpstreamService {
 
         MediaType type = up2.contentType() != null ? up2.contentType() : MediaType.APPLICATION_JSON;
         // 같은 내용을 수명만 다르게 두 벌 쓴다.
-        writeCache(key, type, up2.body(), up.ttlFor(path));
-        writeCache(staleKey, type, up2.body(), up.staleTtl());
-        return new Result(up2.status(), type, up2.body(), "MISS");
+        if (useCache) writeCache(key, type, up2.body(), ttl);
+        if (useStale) writeCache(staleKey, type, up2.body(), staleTtl);
+        return new Result(up2.status(), type, up2.body(), useCache ? "MISS" : "OFF");
+    }
+
+    /** null·0·음수를 한 자리에서 걸러낸다. 호출부마다 세 가지를 따로 검사하면 하나씩 빠진다. */
+    private static boolean isPositive(Duration d) {
+        return d != null && !d.isZero() && !d.isNegative();
     }
 
     /**

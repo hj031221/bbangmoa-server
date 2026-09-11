@@ -67,9 +67,11 @@ app:
 
   ratelimit:
     enabled: true
+    # IP 하나가 /api/** 전체에 보낼 수 있는 분당 요청 수(상류 구분 없음).
     # 프론트가 한 화면을 그릴 때 외부 API를 여러 번 부른다.
     # 카카오 로컬만 해도 구·키워드 분산으로 수십 번 나간다(kakaoLocal.js).
     # 그래서 관광공사만 있을 때의 60 으로는 정상 사용자가 걸린다.
+    # 상류별로 더 조이고 싶으면 아래 upstreams.{이름}.quota.per-minute-per-ip 를 쓴다.
     requests-per-minute: 300
 
   # ── 모든 상류에 공통인 호출 정책 ──────────────────────────────
@@ -87,20 +89,31 @@ app:
   # ── 상류별 설정 ───────────────────────────────────────────────
   # 상류의 차이는 로직이 아니라 데이터다 — 키가 쿼리냐 헤더냐, GET 이냐 POST 냐,
   # 어떤 경로를 여느냐. 그래서 컨트롤러를 복사하지 않고 여기에 적는다.
+  #
+  # routes 가 "무엇이 열려 있는가"의 유일한 목록이다.
+  #   메서드를 상류 전체가 아니라 경로마다 다는 이유:
+  #   카카오 모빌리티는 GET 경로와 POST 경로가 섞여 있다. 상류 단위로 GET,POST 를 열면
+  #   POST /v1/directions 나 GET /v1/waypoints/directions 처럼 실재하지 않는 조합까지
+  #   통과해 상류로 나간다. 그 요청은 상류에서 실패하지만 쿼터는 똑같이 깎인다.
+  #
+  # quota 는 두 겹이다.
+  #   per-minute-per-ip : 한 사람의 폭주를 막는다(캐시 적중도 포함해 센다)
+  #   per-day           : 우리 계정의 일일 쿼터를 막는다. 서버 전체 합계이고,
+  #                       실제로 상류로 나간 호출만 센다(캐시 적중은 안 센다)
   upstreams:
     tour:
       base-url: https://apis.data.go.kr/B551011/KorService2
       auth-type: query
       auth-name: serviceKey
       auth-value: ${TOUR_API_KEY:}
-      allowed-paths: areaBasedList2,detailCommon2,detailIntro2
-      methods: GET
       # 목록은 신규 등록이 반영되므로 짧게, 상세는 contentId 고정 정보라 길게.
       ttl: 6h
-      long-ttl: 24h
-      long-ttl-paths: detailCommon2,detailIntro2
       # 실측 연결 성공률이 40% 수준이라 예비 사본을 길게 붙든다.
       stale-ttl: 7d
+      routes:
+        - { path: areaBasedList2, methods: GET }
+        - { path: detailCommon2,  methods: GET, ttl: 24h }
+        - { path: detailIntro2,   methods: GET, ttl: 24h }
 
     kakao:
       base-url: https://dapi.kakao.com
@@ -109,11 +122,14 @@ app:
       auth-name: Authorization
       auth-prefix: "KakaoAK "
       auth-value: ${KAKAO_REST_KEY:}
-      allowed-paths: v2/local/search/keyword.json,v2/local/geo/coord2regioncode.json,v2/local/geo/coord2address.json,v2/local/search/category.json
-      methods: GET
       # 가게 위치·주소는 자주 안 바뀐다. 길게 잡을수록 쿼터가 산다.
       ttl: 24h
       stale-ttl: 7d
+      routes:
+        - { path: v2/local/search/keyword.json,       methods: GET }
+        - { path: v2/local/search/category.json,      methods: GET }
+        - { path: v2/local/geo/coord2regioncode.json, methods: GET }
+        - { path: v2/local/geo/coord2address.json,    methods: GET }
 
     kakaonavi:
       base-url: https://apis-navi.kakaomobility.com
@@ -122,19 +138,29 @@ app:
       auth-name: Authorization
       auth-prefix: "KakaoAK "
       auth-value: ${KAKAO_REST_KEY:}
-      allowed-paths: v1/directions,v1/waypoints/directions,v1/destinations/directions
-      methods: GET,POST
       # 자동차 소요시간은 교통상황을 반영한다. 길게 캐시하면 거짓말이 된다.
       ttl: 10m
       stale-ttl: 1d
+      routes:
+        # 구간 하나짜리 길찾기. 좌표가 쿼리에 실리므로 GET.
+        - { path: v1/directions,              methods: GET }
+        # 다중 경유지(최대 30곳)와 1:N 매트릭스. 좌표가 JSON 바디라 POST 만 연다.
+        - { path: v1/waypoints/directions,    methods: POST }
+        - { path: v1/destinations/directions, methods: POST }
+      quota:
+        # 카카오 모빌리티 무료 한도가 일 10,000 건이다(프론트 kakaoMobility.js 에 확인 기록).
+        # 8,000 에서 우리가 먼저 끊는다 — 상류가 끊으면 언제 풀리는지 우리가 모르고,
+        # 남긴 2,000 이 "한도에 닿았다"는 걸 알아채고 손쓸 여유가 된다.
+        per-day: 8000
+        # 코스 하나를 다시 계산하면 매트릭스가 스톱 수만큼 순차로 나간다(PilgrimagePage).
+        # 사람이 몇 번 다시 굴려도 안 걸리고, 루프가 폭주하면 걸리는 선.
+        per-minute-per-ip: 60
 
     odsay:
       base-url: https://api.odsay.com
       auth-type: query
       auth-name: apiKey
       auth-value: ${ODSAY_API_KEY:}
-      allowed-paths: v1/api/searchPubTransPathT
-      methods: GET
       # ODSAY 는 Referer 로 등록 도메인을 검사한다. 서버에서 부르면 Referer 가 없어
       # ApiKeyAuthFailed 가 난다(실측). 등록된 주소를 고정으로 붙인다.
       headers:
@@ -142,6 +168,8 @@ app:
       # 대중교통은 시간표 기반이라 교통상황만큼 흔들리지는 않는다.
       ttl: 1h
       stale-ttl: 7d
+      routes:
+        - { path: v1/api/searchPubTransPathT, methods: GET }
 
     tmap:
       base-url: https://apis.openapi.sk.com
@@ -149,12 +177,23 @@ app:
       auth-type: header
       auth-name: appKey
       auth-value: ${TMAP_APP_KEY:}
-      allowed-paths: tmap/routes/pedestrian
-      # 넷 중 유일하게 POST 다. 좌표를 JSON 바디로 보낸다.
-      methods: POST
-      # 도보 경로는 교통상황과 무관하고 길 자체가 잘 안 바뀐다. 길게 잡아도 된다.
-      ttl: 7d
-      stale-ttl: 30d
+      # ── 캐시를 끈다(0 = 읽지도 쓰지도 않는다) ────────────────────
+      # 도보 경로 자체는 잘 안 변해서 캐시하기 좋아 보이지만, 실측하면 반대다.
+      #   응답 크기: 2점 53KB, 경유지 3곳 157KB (관광공사 100건이 66KB, 카카오 15건이 6.5KB)
+      #   레디스는 128MB / allkeys-lru 다. 본사본+예비사본 두 벌이므로 경유지 코스
+      #   400여 개면 레디스가 통째로 찬다. 그러면 LRU 가 관광공사·카카오 캐시부터 밀어낸다.
+      #   게다가 요청마다 출발 좌표(사용자 GPS)가 달라 적중률도 낮다.
+      # 제일 큰 걸 넣어두고 제일 잘 맞는 걸 밀어내는 셈이라, 캐시를 아예 안 쓴다.
+      # 대신 상류로 다 나가므로 아래 per-day 가 유일한 방어선이다.
+      ttl: 0s
+      stale-ttl: 0s
+      routes:
+        - { path: tmap/routes/pedestrian, methods: POST }
+      quota:
+        # ⚠ 확인 필요 — TMAP 대시보드의 실제 무료 한도에 맞춰야 한다.
+        #   확인 전까지는 보수적으로 1,000. 캐시가 없으므로 요청 수 = 상류 호출 수다.
+        per-day: 1000
+        per-minute-per-ip: 60
 
 logging:
   level:
